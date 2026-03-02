@@ -55,8 +55,8 @@ os.environ.setdefault("KEY_COOLDOWN_SECONDS", "60")
 os.environ.setdefault("ALL_EXHAUSTED_SLEEP_SECONDS", "0.05")  # fast in tests
 os.environ.setdefault("MAX_RETRIES", "3")
 
-import main  # noqa: E402  (import after env setup)
-from main import (
+import main_v2 as main  # noqa: E402  (import after env setup)
+from main_v2 import (
     ChatCompletionRequest,
     KeyEntry,
     KeyManager,
