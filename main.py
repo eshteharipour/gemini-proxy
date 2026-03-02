@@ -17,9 +17,12 @@ from typing import Any, AsyncGenerator
 
 import httpx
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
