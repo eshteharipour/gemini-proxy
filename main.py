@@ -31,10 +31,95 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+#
+# DEBUG_MODE=1  → INFO+ goes to stderr AND every request/response is written
+#                 as a structured JSON record to the file set by DEBUG_LOG_FILE
+#                 (default: gemini_proxy_debug.log), one record per line (JSONL).
+#
+# DEBUG_MODE=0  → normal stderr-only logging, no file, no payload capture.
+# ---------------------------------------------------------------------------
+
+DEBUG_MODE: bool = os.environ.get("DEBUG_MODE", "0").strip() in ("1", "true", "yes")
+DEBUG_LOG_FILE: str = os.environ.get("DEBUG_LOG_FILE", "gemini_proxy_debug.log")
+
+_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+if DEBUG_MODE:
+    # Console handler — same as before
+    _console = logging.StreamHandler()
+    _console.setFormatter(logging.Formatter(_fmt))
+
+    # File handler — plain text log lines (not the JSONL payload records)
+    _file_handler = logging.FileHandler(DEBUG_LOG_FILE, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter(_fmt))
+
+    logging.basicConfig(level=logging.DEBUG, handlers=[_console, _file_handler])
+else:
+    logging.basicConfig(level=logging.INFO, format=_fmt)
+
 logger = logging.getLogger("gemini-proxy")
+
+if DEBUG_MODE:
+    logger.info("Debug mode ON — request/response payloads → %s", DEBUG_LOG_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Debug request/response file logger
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_debug_lock = _threading.Lock()
+
+
+def _redact_key(key: str) -> str:
+    """Keep first 4 and last 4 chars, mask the middle."""
+    if len(key) <= 8:
+        return "****"
+    return key[:4] + "*" * (len(key) - 8) + key[-4:]
+
+
+def debug_log(record: dict) -> None:
+    """
+    Append a single JSONL record to DEBUG_LOG_FILE.
+    Each record contains:
+        ts          – ISO-8601 timestamp
+        event       – "request" | "response" | "stream_start" | "stream_end" | "error"
+        endpoint    – Gemini REST path called
+        key_suffix  – last 6 chars of the API key used
+        payload     – outgoing request body  (event=request)
+        response    – Gemini response body   (event=response)
+        status      – HTTP status code
+        elapsed_ms  – wall-clock ms for the round-trip
+        ...
+    Image inlineData is truncated to avoid massive log files.
+    """
+    if not DEBUG_MODE:
+        return
+
+    # Truncate base64 image blobs so logs stay readable
+    def _scrub(obj: Any, depth: int = 0) -> Any:
+        if depth > 10:
+            return obj
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if k == "data" and isinstance(v, str) and len(v) > 80:
+                    out[k] = v[:40] + f"…[{len(v)} chars]"
+                else:
+                    out[k] = _scrub(v, depth + 1)
+            return out
+        if isinstance(obj, list):
+            return [_scrub(i, depth + 1) for i in obj]
+        return obj
+
+    record = _scrub(record)
+    record.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+    line = json.dumps(record, ensure_ascii=False)
+    with _debug_lock:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +204,8 @@ def _parse_key_proxy_pairs() -> list[dict]:
 class KeyEntry:
     def __init__(self, key: str, proxy: str | None):
         self.key = key
-        self.proxy = proxy  # e.g. "http://user:pass@host:port" or None
-        self.exhausted_until: float = 0.0  # epoch seconds
+        self.proxy = proxy  # e.g. "http://user:pass@host:port"
+        self.exhausted_until: float = 0.0
         self.total_requests: int = 0
         self.total_errors: int = 0
 
@@ -134,7 +219,10 @@ class KeyEntry:
 
     def make_http_client(self, timeout: float = 120.0) -> httpx.AsyncClient:
         # httpx.AsyncClient uses `proxy=` (singular) since v0.23
-        return httpx.AsyncClient(proxy=self.proxy, timeout=timeout)
+        return httpx.AsyncClient(
+            proxy=self.proxy,  # None → no proxy (direct connection)
+            timeout=timeout,
+        )
 
 
 class KeyManager:
@@ -407,6 +495,7 @@ async def call_gemini(key_manager: KeyManager, req: ChatCompletionRequest) -> di
         entry = await key_manager.next_available()
         entry.total_requests += 1
 
+        endpoint = f"models/{gemini_model}:generateContent"
         logger.info(
             "Attempt %d/%d | key=…%s | proxy=%s | model=%s",
             attempt,
@@ -415,30 +504,76 @@ async def call_gemini(key_manager: KeyManager, req: ChatCompletionRequest) -> di
             entry.proxy,
             gemini_model,
         )
+        debug_log(
+            {
+                "event": "request",
+                "endpoint": endpoint,
+                "key_suffix": entry.key[-6:],
+                "attempt": attempt,
+                "payload": payload,
+            }
+        )
 
+        t0 = time.monotonic()
         try:
             async with entry.make_http_client() as client:
                 resp = await client.post(
-                    f"{GEMINI_BASE}/models/{gemini_model}:generateContent",
+                    f"{GEMINI_BASE}/{endpoint}",
                     params={"key": entry.key},
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
         except httpx.RequestError as exc:
+            elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
             entry.total_errors += 1
             entry.mark_exhausted(cooldown=10)
             last_error = exc
+            debug_log(
+                {
+                    "event": "error",
+                    "endpoint": endpoint,
+                    "key_suffix": entry.key[-6:],
+                    "attempt": attempt,
+                    "error": str(exc),
+                    "elapsed_ms": elapsed_ms,
+                }
+            )
             logger.warning("Network error (attempt %d): %s", attempt, exc)
             continue
 
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+
         if resp.status_code == 200:
-            return _gemini_to_openai(resp.json(), gemini_model)
+            gemini_body = resp.json()
+            debug_log(
+                {
+                    "event": "response",
+                    "endpoint": endpoint,
+                    "key_suffix": entry.key[-6:],
+                    "attempt": attempt,
+                    "status": 200,
+                    "elapsed_ms": elapsed_ms,
+                    "response": gemini_body,
+                }
+            )
+            return _gemini_to_openai(gemini_body, gemini_model)
 
         is_json = "application/json" in resp.headers.get("content-type", "")
         body = resp.json() if is_json else {}
         err_msg = body.get("error", {}).get("message", resp.text[:300])
         status = resp.status_code
         entry.total_errors += 1
+        debug_log(
+            {
+                "event": "error",
+                "endpoint": endpoint,
+                "key_suffix": entry.key[-6:],
+                "attempt": attempt,
+                "status": status,
+                "elapsed_ms": elapsed_ms,
+                "error": err_msg,
+            }
+        )
         logger.warning("Gemini %d (attempt %d): %s", status, attempt, err_msg)
 
         if status in (429, 503):
@@ -476,10 +611,23 @@ async def call_gemini_stream(
     entry = await key_manager.next_available()
     entry.total_requests += 1
 
+    endpoint = f"models/{gemini_model}:streamGenerateContent"
+    debug_log(
+        {
+            "event": "request",
+            "endpoint": endpoint,
+            "key_suffix": entry.key[-6:],
+            "payload": payload,
+        }
+    )
+
+    t0 = time.monotonic()
+    stream_chunks: list[dict] = []  # collected only in DEBUG_MODE
+
     async with entry.make_http_client() as client:
         async with client.stream(
             "POST",
-            f"{GEMINI_BASE}/models/{gemini_model}:streamGenerateContent",
+            f"{GEMINI_BASE}/{endpoint}",
             params={"key": entry.key, "alt": "sse"},
             json=payload,
             headers={"Content-Type": "application/json"},
@@ -488,6 +636,16 @@ async def call_gemini_stream(
                 entry.total_errors += 1
                 entry.mark_exhausted()
                 body = await resp.aread()
+                debug_log(
+                    {
+                        "event": "error",
+                        "endpoint": endpoint,
+                        "key_suffix": entry.key[-6:],
+                        "status": resp.status_code,
+                        "elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
+                        "error": body.decode()[:300],
+                    }
+                )
                 raise HTTPException(status_code=502, detail=body.decode())
 
             chunk_idx = 0
@@ -496,12 +654,26 @@ async def call_gemini_stream(
                     continue
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
+                    debug_log(
+                        {
+                            "event": "stream_end",
+                            "endpoint": endpoint,
+                            "key_suffix": entry.key[-6:],
+                            "status": 200,
+                            "total_chunks": chunk_idx,
+                            "elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
+                            "chunks": stream_chunks,
+                        }
+                    )
                     yield "data: [DONE]\n\n"
                     return
                 try:
                     gemini_chunk = json.loads(data_str)
                 except Exception:
                     continue
+
+                if DEBUG_MODE:
+                    stream_chunks.append(gemini_chunk)
 
                 for cand in gemini_chunk.get("candidates", []):
                     parts = cand.get("content", {}).get("parts", [])
@@ -537,22 +709,55 @@ async def count_tokens_gemini(key_manager: KeyManager, req: TokenCountRequest) -
     entry = await key_manager.next_available()
     entry.total_requests += 1
 
+    endpoint = f"models/{gemini_model}:countTokens"
+    debug_log(
+        {
+            "event": "request",
+            "endpoint": endpoint,
+            "key_suffix": entry.key[-6:],
+            "payload": payload,
+        }
+    )
+
+    t0 = time.monotonic()
     async with entry.make_http_client() as client:
         resp = await client.post(
-            f"{GEMINI_BASE}/models/{gemini_model}:countTokens",
+            f"{GEMINI_BASE}/{endpoint}",
             params={"key": entry.key},
             json=payload,
             headers={"Content-Type": "application/json"},
         )
+    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
 
     if resp.status_code != 200:
         is_json = "application/json" in resp.headers.get("content-type", "")
         body = resp.json() if is_json else {}
         err = body.get("error", {}).get("message", resp.text[:200])
         entry.total_errors += 1
+        debug_log(
+            {
+                "event": "error",
+                "endpoint": endpoint,
+                "key_suffix": entry.key[-6:],
+                "status": resp.status_code,
+                "elapsed_ms": elapsed_ms,
+                "error": err,
+            }
+        )
         raise HTTPException(status_code=502, detail=f"Token count error: {err}")
 
-    return resp.json().get("totalTokens", 0)
+    result = resp.json()
+    debug_log(
+        {
+            "event": "response",
+            "endpoint": endpoint,
+            "key_suffix": entry.key[-6:],
+            "status": 200,
+            "elapsed_ms": elapsed_ms,
+            "response": result,
+        }
+    )
+    return result.get("totalTokens", 0)
 
 
 # ---------------------------------------------------------------------------
