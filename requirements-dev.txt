@@ -1,1 +1,11 @@
-pytest pytest-asyncio respx fastapi httpx uvicorn pydantic python-dotenv
+# Mock Tests
+respx
+fastapi
+httpx
+uvicorn
+pydantic
+python-dotenv
+
+# Real Tests
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
