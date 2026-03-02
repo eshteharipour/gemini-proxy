@@ -1,14 +1,18 @@
 """
-Gemini OpenAI-compatible proxy service.
+Gemini → OpenAI-compatible proxy service.
 
-Key features:
-- OpenAI /v1/chat/completions compatible endpoint
-- Key ↔ Proxy pairing: each Gemini key has a dedicated proxy
-- Exhausted keys are cooled down for a configurable window
-- When ALL keys are exhausted the service sleeps briefly then retries
+Features:
+- OpenAI /v1/chat/completions  (streaming supported)
+- Structured output via response_schema  (pass as `schema` field or `response_format.json_schema`)
+- Image inference  (OpenAI image_url content blocks → Gemini inline image parts)
+- Token counting  POST /v1/token/count
+- Key ↔ Proxy pairing: each Gemini key has its own dedicated proxy
+- Per-key cooldown on 429/503; sleeps until a key recovers when all are exhausted
 """
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import time
@@ -18,7 +22,7 @@ from typing import Any, AsyncGenerator
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -34,24 +38,31 @@ logger = logging.getLogger("gemini-proxy")
 
 
 # ---------------------------------------------------------------------------
-# Configuration helpers
+# Configuration
 # ---------------------------------------------------------------------------
+
+COOLDOWN_SECONDS = int(os.environ.get("KEY_COOLDOWN_SECONDS", "60"))
+ALL_EXHAUSTED_SLEEP = float(os.environ.get("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
+DEFAULT_GEMINI_MODEL = os.environ.get(
+    "DEFAULT_GEMINI_MODEL", "gemini-flash-lite-latest"
+)
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _parse_key_proxy_pairs() -> list[dict]:
     """
-    Supports two config styles (can be mixed):
+    Three config styles (all can coexist):
 
-    Style 1 – indexed env vars:
-        GEMINI_KEY_0=AIza...   GEMINI_PROXY_0=http://proxy0:8080
-        GEMINI_KEY_1=AIza...   GEMINI_PROXY_1=http://proxy1:8080
-        (GEMINI_PROXY_N is optional; if absent the pair uses no proxy)
+    Style 1 – indexed env vars (most explicit, recommended):
+        GEMINI_KEY_0=AIza...   GEMINI_PROXY_0=http://user:pass@proxy0:8080
+        GEMINI_KEY_1=AIza...   # no GEMINI_PROXY_1 → direct connection
 
-    Style 2 – CSV pair list:
-        GEMINI_PAIRS_CSV=key1|proxy1,key2|proxy2,key3   (proxy is optional)
+    Style 2 – single CSV:
+        GEMINI_PAIRS_CSV=key1|http://proxy1:8080,key2|http://proxy2:8080,key3
 
     Style 3 – legacy separate CSVs (keys round-robin over proxies):
-        GEMINI_API_CSV=key1,key2   PROXY_CSV=proxy1,proxy2
+        GEMINI_API_CSV=key1,key2   PROXY_CSV=http://proxy1:8080,http://proxy2:8080
     """
     pairs: list[dict] = []
 
@@ -66,15 +77,17 @@ def _parse_key_proxy_pairs() -> list[dict]:
         i += 1
 
     # Style 2
-    csv_pairs = os.environ.get("GEMINI_PAIRS_CSV", "")
-    for token in csv_pairs.split(","):
+    for token in os.environ.get("GEMINI_PAIRS_CSV", "").split(","):
         token = token.strip()
         if not token:
             continue
         parts = token.split("|", 1)
-        key = parts[0].strip()
-        proxy = parts[1].strip() if len(parts) > 1 else None
-        pairs.append({"key": key, "proxy": proxy or None})
+        pairs.append(
+            {
+                "key": parts[0].strip(),
+                "proxy": parts[1].strip() if len(parts) > 1 else None,
+            }
+        )
 
     # Style 3 – legacy fallback
     if not pairs:
@@ -93,19 +106,14 @@ def _parse_key_proxy_pairs() -> list[dict]:
     if not pairs:
         raise RuntimeError(
             "No Gemini API keys configured. "
-            "Set GEMINI_KEY_0 / GEMINI_PROXY_0 pairs, GEMINI_PAIRS_CSV, or GEMINI_API_CSV."
+            "Set GEMINI_KEY_0/GEMINI_PROXY_0 pairs, GEMINI_PAIRS_CSV, or GEMINI_API_CSV."
         )
-
     return pairs
 
 
 # ---------------------------------------------------------------------------
-# Key manager
+# Key / Proxy management
 # ---------------------------------------------------------------------------
-
-COOLDOWN_SECONDS = int(os.environ.get("KEY_COOLDOWN_SECONDS", "60"))
-ALL_EXHAUSTED_SLEEP = float(os.environ.get("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 
 
 class KeyEntry:
@@ -120,14 +128,13 @@ class KeyEntry:
     def available(self) -> bool:
         return time.monotonic() >= self.exhausted_until
 
-    def mark_exhausted(self, cooldown: float = COOLDOWN_SECONDS):
+    def mark_exhausted(self, cooldown: float = COOLDOWN_SECONDS) -> None:
         self.exhausted_until = time.monotonic() + cooldown
-        logger.warning("Key ...%s cooled down for %ss", self.key[-6:], cooldown)
+        logger.warning("Key …%s cooled down for %.0fs", self.key[-6:], cooldown)
 
-    def make_http_client(self) -> httpx.AsyncClient:
-        # httpx >= 0.28 removed the `proxies` dict argument; use `proxy` (singular) instead
-        proxy = self.proxy if self.proxy else None
-        return httpx.AsyncClient(proxy=proxy, timeout=120)
+    def make_http_client(self, timeout: float = 120.0) -> httpx.AsyncClient:
+        # httpx.AsyncClient uses `proxy=` (singular) since v0.23
+        return httpx.AsyncClient(proxy=self.proxy, timeout=timeout)
 
 
 class KeyManager:
@@ -137,8 +144,7 @@ class KeyManager:
         self._lock = asyncio.Lock()
 
     async def next_available(self) -> KeyEntry:
-        """Round-robin over available keys; sleeps if all are exhausted."""
-        attempts = 0
+        """Round-robin; blocks until a key is out of cooldown."""
         while True:
             async with self._lock:
                 for _ in range(len(self.entries)):
@@ -147,13 +153,10 @@ class KeyManager:
                     if entry.available:
                         return entry
 
-            # All keys exhausted
-            attempts += 1
+            # All keys exhausted — sleep until the nearest recovery
             wait_until = min(e.exhausted_until for e in self.entries)
             sleep_for = max(0.1, wait_until - time.monotonic())
-            logger.warning(
-                "All keys exhausted (attempt %d). Sleeping %.1fs …", attempts, sleep_for
-            )
+            logger.warning("All keys exhausted. Sleeping %.1fs …", sleep_for)
             await asyncio.sleep(sleep_for)
 
     def stats(self) -> list[dict]:
@@ -163,7 +166,7 @@ class KeyManager:
                 "key_suffix": e.key[-6:],
                 "proxy": e.proxy,
                 "available": e.available,
-                "cooldown_remaining": max(0.0, round(e.exhausted_until - now, 1)),
+                "cooldown_remaining_s": max(0.0, round(e.exhausted_until - now, 1)),
                 "total_requests": e.total_requests,
                 "total_errors": e.total_errors,
             }
@@ -172,8 +175,9 @@ class KeyManager:
 
 
 # ---------------------------------------------------------------------------
-# Model name mapping  (OpenAI name → Gemini name)
+# Model mapping
 # ---------------------------------------------------------------------------
+
 
 MODEL_MAP: dict[str, str] = {
     # allow pass-through of native Gemini names
@@ -182,23 +186,19 @@ MODEL_MAP: dict[str, str] = {
     "gemini-flash-lite-latest": "gemini-flash-lite-latest",
 }
 
-DEFAULT_GEMINI_MODEL = os.environ.get(
-    "DEFAULT_GEMINI_MODEL", "gemini-flash-lite-latest"
-)
 
-
-def resolve_model(openai_model: str) -> str:
-    return MODEL_MAP.get(openai_model, openai_model)
+def resolve_model(name: str) -> str:
+    return MODEL_MAP.get(name, name)
 
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible request / response schemas
+# OpenAI request schemas
 # ---------------------------------------------------------------------------
 
 
 class Message(BaseModel):
     role: str
-    content: str | list[Any]
+    content: str | list[Any]  # str or OpenAI content-part list
 
 
 class ChatCompletionRequest(BaseModel):
@@ -211,74 +211,145 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     stop: list[str] | str | None = None
     n: int | None = 1
+    # ── Structured output ────────────────────────────────────────────────────
+    # Option A (OpenAI-style):
+    #   response_format={"type": "json_schema", "json_schema": {"schema": {...}}}
+    # Option B (direct Gemini schema, non-standard but convenient):
+    #   schema={...}
+    # Option C (plain JSON mode, no schema enforcement):
+    #   response_format={"type": "json_object"}
     response_format: dict | None = None
+    schema: dict | None = None
+
+
+class TokenCountRequest(BaseModel):
+    model: str = DEFAULT_GEMINI_MODEL
+    messages: list[Message]
 
 
 # ---------------------------------------------------------------------------
-# Gemini REST helpers
+# Content conversion helpers
 # ---------------------------------------------------------------------------
 
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+def _url_to_inline_data(url: str) -> dict:
+    """
+    Fetch an image URL (or parse a data URI) and return a Gemini inlineData part.
+    """
+    if url.startswith("data:"):
+        # data:image/png;base64,<data>
+        header, b64 = url.split(",", 1)
+        mime = header.split(";")[0].split(":")[1]
+        return {"inlineData": {"mimeType": mime, "data": b64}}
+
+    # Remote URL – download synchronously (called before async context starts)
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+    b64 = base64.b64encode(resp.content).decode()
+    return {"inlineData": {"mimeType": mime, "data": b64}}
 
 
-def _openai_messages_to_gemini(
-    messages: list[Message],
-) -> tuple[str | None, list[dict]]:
-    """Convert OpenAI messages → (system_instruction, gemini_contents)."""
-    system_instruction = None
-    contents = []
+def _content_to_gemini_parts(content: str | list[Any]) -> list[dict]:
+    """
+    Convert an OpenAI message content value to a list of Gemini Part dicts.
+
+    Handled OpenAI part types:
+      {"type": "text",      "text": "..."}
+      {"type": "image_url", "image_url": {"url": "..."}}
+    """
+    if isinstance(content, str):
+        return [{"text": content}]
+
+    parts: list[dict] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append({"text": item})
+            continue
+        t = item.get("type", "")
+        if t == "text":
+            parts.append({"text": item["text"]})
+        elif t == "image_url":
+            parts.append(_url_to_inline_data(item["image_url"]["url"]))
+        else:
+            logger.debug("Unknown content part type ignored: %s", t)
+    return parts
+
+
+def _messages_to_gemini(messages: list[Message]) -> tuple[str | None, list[dict]]:
+    """Returns (system_instruction | None, gemini_contents)."""
+    system_instruction: str | None = None
+    contents: list[dict] = []
 
     for msg in messages:
-        role = msg.role
-        content = (
-            msg.content
-            if isinstance(msg.content, str)
-            else _flatten_content(msg.content)
-        )
-
-        if role == "system":
-            system_instruction = content
-        elif role == "assistant":
-            contents.append({"role": "model", "parts": [{"text": content}]})
-        else:  # user / tool / function
-            contents.append({"role": "user", "parts": [{"text": content}]})
+        if msg.role == "system":
+            if isinstance(msg.content, str):
+                system_instruction = msg.content
+            else:
+                system_instruction = " ".join(
+                    p.get("text", "")
+                    for p in msg.content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+        else:
+            gemini_role = "model" if msg.role == "assistant" else "user"
+            contents.append(
+                {
+                    "role": gemini_role,
+                    "parts": _content_to_gemini_parts(msg.content),
+                }
+            )
 
     return system_instruction, contents
 
 
-def _flatten_content(parts: list[Any]) -> str:
-    texts = []
-    for p in parts:
-        if isinstance(p, dict) and p.get("type") == "text":
-            texts.append(p["text"])
-        elif isinstance(p, str):
-            texts.append(p)
-    return " ".join(texts)
+# ---------------------------------------------------------------------------
+# Payload builder
+# ---------------------------------------------------------------------------
 
 
-def _build_gemini_payload(req: ChatCompletionRequest) -> dict:
-    system_instruction, contents = _openai_messages_to_gemini(req.messages)
+def _resolve_schema(req: ChatCompletionRequest) -> dict | None:
+    """
+    Returns:
+        None          → no JSON mode
+        {}            → JSON mode, no schema enforcement
+        {<schema>}    → JSON mode + schema enforcement
+    """
+    if req.schema:
+        return req.schema
+    if req.response_format:
+        fmt = req.response_format
+        if fmt.get("type") == "json_schema" and "json_schema" in fmt:
+            return fmt["json_schema"].get("schema") or {}
+        if fmt.get("type") == "json_object":
+            return {}
+    return None
 
-    generation_config: dict[str, Any] = {
+
+def _build_payload(req: ChatCompletionRequest) -> dict:
+    system_instruction, contents = _messages_to_gemini(req.messages)
+    schema = _resolve_schema(req)
+
+    gen_cfg: dict[str, Any] = {
         "temperature": req.temperature,
         "maxOutputTokens": req.max_tokens or 8192,
     }
     if req.top_p is not None:
-        generation_config["topP"] = req.top_p
+        gen_cfg["topP"] = req.top_p
     if req.top_k is not None:
-        generation_config["topK"] = req.top_k
+        gen_cfg["topK"] = req.top_k
     if req.stop:
-        generation_config["stopSequences"] = (
-            [req.stop] if isinstance(req.stop, str) else req.stop
-        )
+        gen_cfg["stopSequences"] = [req.stop] if isinstance(req.stop, str) else req.stop
 
-    # JSON mode
-    if req.response_format and req.response_format.get("type") == "json_object":
-        generation_config["responseMimeType"] = "application/json"
+    if schema is not None:
+        gen_cfg["responseMimeType"] = "application/json"
+        if schema:  # non-empty → enforce the schema
+            gen_cfg["responseSchema"] = schema
 
     payload: dict[str, Any] = {
         "contents": contents,
-        "generationConfig": generation_config,
+        "generationConfig": gen_cfg,
     }
     if system_instruction:
         payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
@@ -286,10 +357,14 @@ def _build_gemini_payload(req: ChatCompletionRequest) -> dict:
     return payload
 
 
-def _gemini_to_openai_response(gemini_resp: dict, model: str) -> dict:
-    candidates = gemini_resp.get("candidates", [])
+# ---------------------------------------------------------------------------
+# Response conversion
+# ---------------------------------------------------------------------------
+
+
+def _gemini_to_openai(gemini: dict, model: str) -> dict:
     choices = []
-    for i, cand in enumerate(candidates):
+    for i, cand in enumerate(gemini.get("candidates", [])):
         parts = cand.get("content", {}).get("parts", [])
         text = "".join(p.get("text", "") for p in parts)
         finish = cand.get("finishReason", "stop").lower()
@@ -303,7 +378,7 @@ def _gemini_to_openai_response(gemini_resp: dict, model: str) -> dict:
             }
         )
 
-    usage = gemini_resp.get("usageMetadata", {})
+    usage = gemini.get("usageMetadata", {})
     return {
         "id": f"chatcmpl-gemini-{int(time.time())}",
         "object": "chat.completion",
@@ -319,27 +394,21 @@ def _gemini_to_openai_response(gemini_resp: dict, model: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Core request handler (with retry + key rotation)
+# Core call (with retry + key rotation)
 # ---------------------------------------------------------------------------
 
 
-async def call_gemini(
-    key_manager: KeyManager,
-    req: ChatCompletionRequest,
-) -> dict:
+async def call_gemini(key_manager: KeyManager, req: ChatCompletionRequest) -> dict:
     gemini_model = resolve_model(req.model)
-    payload = _build_gemini_payload(req)
-    url_tmpl = f"{GEMINI_BASE}/models/{{model}}:generateContent"
-
+    payload = _build_payload(req)
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         entry = await key_manager.next_available()
         entry.total_requests += 1
-        url = url_tmpl.format(model=gemini_model)
 
         logger.info(
-            "Attempt %d/%d | key=...%s | proxy=%s | model=%s",
+            "Attempt %d/%d | key=…%s | proxy=%s | model=%s",
             attempt,
             MAX_RETRIES,
             entry.key[-6:],
@@ -347,51 +416,44 @@ async def call_gemini(
             gemini_model,
         )
 
-        async with entry.make_http_client() as client:
-            try:
+        try:
+            async with entry.make_http_client() as client:
                 resp = await client.post(
-                    url,
+                    f"{GEMINI_BASE}/models/{gemini_model}:generateContent",
                     params={"key": entry.key},
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
-            except httpx.RequestError as exc:
-                entry.total_errors += 1
-                entry.mark_exhausted(cooldown=10)
-                last_error = exc
-                logger.warning("Network error on attempt %d: %s", attempt, exc)
-                continue
+        except httpx.RequestError as exc:
+            entry.total_errors += 1
+            entry.mark_exhausted(cooldown=10)
+            last_error = exc
+            logger.warning("Network error (attempt %d): %s", attempt, exc)
+            continue
 
         if resp.status_code == 200:
-            return _gemini_to_openai_response(resp.json(), gemini_model)
+            return _gemini_to_openai(resp.json(), gemini_model)
 
-        body = (
-            resp.json()
-            if resp.headers.get("content-type", "").startswith("application/json")
-            else {}
-        )
-        err_msg = body.get("error", {}).get("message", resp.text[:200])
+        is_json = "application/json" in resp.headers.get("content-type", "")
+        body = resp.json() if is_json else {}
+        err_msg = body.get("error", {}).get("message", resp.text[:300])
         status = resp.status_code
-
         entry.total_errors += 1
-        logger.warning("Gemini error %d on attempt %d: %s", status, attempt, err_msg)
+        logger.warning("Gemini %d (attempt %d): %s", status, attempt, err_msg)
 
-        if status == 429 or status == 503:
-            # Rate-limited or overloaded → cooldown this key
+        if status in (429, 503):
             entry.mark_exhausted()
             last_error = HTTPException(status_code=429, detail=err_msg)
         elif status == 400:
-            # Bad request – no point retrying
             raise HTTPException(status_code=400, detail=err_msg)
-        elif status == 401 or status == 403:
-            # Invalid key – long cooldown
+        elif status in (401, 403):
             entry.mark_exhausted(cooldown=3600)
             last_error = HTTPException(
                 status_code=502, detail=f"Gemini auth error: {err_msg}"
             )
         else:
             last_error = HTTPException(
-                status_code=502, detail=f"Gemini error {status}: {err_msg}"
+                status_code=502, detail=f"Gemini {status}: {err_msg}"
             )
             await asyncio.sleep(ALL_EXHAUSTED_SLEEP)
 
@@ -401,17 +463,15 @@ async def call_gemini(
 
 
 # ---------------------------------------------------------------------------
-# Streaming support
+# Streaming
 # ---------------------------------------------------------------------------
 
 
 async def call_gemini_stream(
-    key_manager: KeyManager,
-    req: ChatCompletionRequest,
+    key_manager: KeyManager, req: ChatCompletionRequest
 ) -> AsyncGenerator[str, None]:
     gemini_model = resolve_model(req.model)
-    payload = _build_gemini_payload(req)
-    url = f"{GEMINI_BASE}/models/{gemini_model}:streamGenerateContent"
+    payload = _build_payload(req)
 
     entry = await key_manager.next_available()
     entry.total_requests += 1
@@ -419,7 +479,7 @@ async def call_gemini_stream(
     async with entry.make_http_client() as client:
         async with client.stream(
             "POST",
-            url,
+            f"{GEMINI_BASE}/models/{gemini_model}:streamGenerateContent",
             params={"key": entry.key, "alt": "sse"},
             json=payload,
             headers={"Content-Type": "application/json"},
@@ -430,7 +490,7 @@ async def call_gemini_stream(
                 body = await resp.aread()
                 raise HTTPException(status_code=502, detail=body.decode())
 
-            chunk_index = 0
+            chunk_idx = 0
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -438,36 +498,61 @@ async def call_gemini_stream(
                 if data_str == "[DONE]":
                     yield "data: [DONE]\n\n"
                     return
-
-                import json
-
                 try:
                     gemini_chunk = json.loads(data_str)
                 except Exception:
                     continue
 
-                candidates = gemini_chunk.get("candidates", [])
-                for cand in candidates:
+                for cand in gemini_chunk.get("candidates", []):
                     parts = cand.get("content", {}).get("parts", [])
                     text = "".join(p.get("text", "") for p in parts)
                     finish = cand.get("finishReason")
                     openai_chunk = {
-                        "id": f"chatcmpl-gemini-stream-{int(time.time())}",
+                        "id": f"chatcmpl-gemini-{int(time.time())}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": gemini_model,
                         "choices": [
                             {
-                                "index": chunk_index,
+                                "index": chunk_idx,
                                 "delta": {"role": "assistant", "content": text},
                                 "finish_reason": finish,
                             }
                         ],
                     }
-                    chunk_index += 1
-                    import json as _json
+                    chunk_idx += 1
+                    yield f"data: {json.dumps(openai_chunk)}\n\n"
 
-                    yield f"data: {_json.dumps(openai_chunk)}\n\n"
+
+# ---------------------------------------------------------------------------
+# Token counting
+# ---------------------------------------------------------------------------
+
+
+async def count_tokens_gemini(key_manager: KeyManager, req: TokenCountRequest) -> int:
+    gemini_model = resolve_model(req.model)
+    _, contents = _messages_to_gemini(req.messages)
+    payload = {"contents": contents}
+
+    entry = await key_manager.next_available()
+    entry.total_requests += 1
+
+    async with entry.make_http_client() as client:
+        resp = await client.post(
+            f"{GEMINI_BASE}/models/{gemini_model}:countTokens",
+            params={"key": entry.key},
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+    if resp.status_code != 200:
+        is_json = "application/json" in resp.headers.get("content-type", "")
+        body = resp.json() if is_json else {}
+        err = body.get("error", {}).get("message", resp.text[:200])
+        entry.total_errors += 1
+        raise HTTPException(status_code=502, detail=f"Token count error: {err}")
+
+    return resp.json().get("totalTokens", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +569,11 @@ async def lifespan(app: FastAPI):
     key_manager = KeyManager(pairs)
     logger.info("Loaded %d key-proxy pair(s).", len(pairs))
     for p in pairs:
-        logger.info("  key=...%s  proxy=%s", p["key"][-6:], p["proxy"])
+        logger.info("  key=…%s  proxy=%s", p["key"][-6:], p["proxy"])
     yield
 
 
-app = FastAPI(title="Gemini → OpenAI Proxy", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Gemini → OpenAI Proxy", version="2.0.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +583,7 @@ app = FastAPI(title="Gemini → OpenAI Proxy", version="1.0.0", lifespan=lifespa
 
 @app.get("/v1/models")
 async def list_models():
-    models = list(set(MODEL_MAP.values()))
+    models = sorted(set(MODEL_MAP.values()))
     return {
         "object": "list",
         "data": [
@@ -509,7 +594,7 @@ async def list_models():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, request: Request):
+async def chat_completions(req: ChatCompletionRequest):
     if key_manager is None:
         raise HTTPException(status_code=503, detail="Service not ready")
 
@@ -520,8 +605,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    result = await call_gemini(key_manager, req)
-    return JSONResponse(content=result)
+    return JSONResponse(content=await call_gemini(key_manager, req))
+
+
+@app.post("/v1/token/count")
+async def token_count(req: TokenCountRequest):
+    """
+    Count prompt tokens for a given model + messages list.
+
+    Request body: same shape as /v1/chat/completions minus generation params.
+    Response: {"model": "gemini-2.0-flash", "total_tokens": 1234}
+    """
+    if key_manager is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    total = await count_tokens_gemini(key_manager, req)
+    return {"model": resolve_model(req.model), "total_tokens": total}
 
 
 @app.get("/health")
