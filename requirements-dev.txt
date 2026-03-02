@@ -1,0 +1,1 @@
+pytest pytest-asyncio respx fastapi httpx uvicorn pydantic python-dotenv
