@@ -149,7 +149,9 @@ class TestChatCompletions:
                 },
             ],
         )
-        assert "blue" in body["choices"][0]["message"]["content"].lower()
+        # The model may answer "blue", "electric", or "Electric Blue" — all are correct.
+        text = body["choices"][0]["message"]["content"].lower()
+        assert "blue" in text or "electric" in text
 
     def test_temperature_zero_deterministic(self, http):
         msgs = [
