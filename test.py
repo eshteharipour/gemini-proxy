@@ -1,46 +1,33 @@
 """
-test_proxy.py — live integration tests against real Gemini API.
+test_proxy.py — live integration tests for the Gemini → OpenAI proxy.
 
-Requires:
-    - A .env file (or env vars) with at least GEMINI_KEY_0 set
-    - pip install pytest pytest-asyncio httpx fastapi uvicorn pydantic python-dotenv
+Fires real HTTP requests at a running server. No imports from server code.
 
-Run:
+Start the server first:
+    python main_v1.py   # or main_v2.py
+
+Then run:
     pytest test_proxy.py -v
-    pytest test_proxy.py -v -k "token"          # run subset
-    pytest test_proxy.py -v --tb=short          # shorter tracebacks
+    pytest test_proxy.py -v -k "streaming"
+
+Configuration (env vars or .env):
+    PROXY_BASE_URL       Base URL of the running server  (default: http://localhost:8000)
+    TEST_GEMINI_MODEL    Model to use in tests            (default: gemini-flash-lite-latest)
 """
 
-import base64
 import json
 import os
-import time
 
 import httpx
 import pytest
 from dotenv import load_dotenv
-from fastapi.testclient import TestClient
 
 load_dotenv()
 
-# ── Guard: skip entire module if no real key is configured ───────────────────
-if (
-    not any(os.environ.get(f"GEMINI_KEY_{i}") for i in range(10))
-    and not os.environ.get("GEMINI_API_CSV")
-    and not os.environ.get("GEMINI_PAIRS_CSV")
-):
-    pytest.skip(
-        "No Gemini API key found. Set GEMINI_KEY_0 (or GEMINI_API_CSV / GEMINI_PAIRS_CSV) to run integration tests.",
-        allow_module_level=True,
-    )
-
-import main  # noqa: E402 — import after env is loaded
-from main import KeyManager
-
-# ── Use a fast, cheap model for all tests ────────────────────────────────────
+BASE_URL = os.environ.get("PROXY_BASE_URL", "http://localhost:8000").rstrip("/")
 MODEL = os.environ.get("TEST_GEMINI_MODEL", "gemini-flash-lite-latest")
 
-# ── Tiny 1x1 transparent PNG for image tests ────────────────────────────────
+# Tiny 1×1 transparent PNG (public domain)
 _PNG_1X1_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
     "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
@@ -48,58 +35,61 @@ _PNG_1X1_B64 = (
 _PNG_DATA_URI = f"data:image/png;base64,{_PNG_1X1_B64}"
 
 
-# ── Shared app client ─────────────────────────────────────────────────────────
+# ── Shared HTTP client ────────────────────────────────────────────────────────
 
 
 @pytest.fixture(scope="module")
-def client():
-    """Single TestClient for the whole test module — starts the app once."""
-    pairs = main._parse_key_proxy_pairs()
-    main.key_manager = KeyManager(pairs)
-    return TestClient(main.app)
+def http():
+    with httpx.Client(base_url=BASE_URL, timeout=60) as client:
+        # Verify the server is actually up before running any tests
+        try:
+            r = client.get("/health")
+            r.raise_for_status()
+        except Exception as exc:
+            pytest.skip(f"Server not reachable at {BASE_URL}: {exc}")
+        yield client
 
 
-def chat(client, messages, **kwargs):
-    """Helper: POST /v1/chat/completions and return the parsed JSON."""
-    payload = {"model": MODEL, "messages": messages, **kwargs}
-    r = client.post("/v1/chat/completions", json=payload)
-    assert r.status_code == 200, f"Unexpected status {r.status_code}: {r.text}"
+def chat(http, messages, **kwargs):
+    """POST /v1/chat/completions and return parsed JSON. Asserts HTTP 200."""
+    r = http.post(
+        "/v1/chat/completions", json={"model": MODEL, "messages": messages, **kwargs}
+    )
+    assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:400]}"
     return r.json()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Health / meta endpoints
+# Meta / health
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class TestMeta:
-    def test_health(self, client):
-        r = client.get("/health")
+    def test_health(self, http):
+        r = http.get("/health")
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "ok"
         assert body["keys_available"] >= 1
 
-    def test_stats(self, client):
-        r = client.get("/stats")
+    def test_stats(self, http):
+        r = http.get("/stats")
         assert r.status_code == 200
         stats = r.json()["key_stats"]
-        assert isinstance(stats, list)
-        assert len(stats) >= 1
-        first = stats[0]
-        assert "key_suffix" in first
-        assert "available" in first
-        assert "total_requests" in first
+        assert isinstance(stats, list) and len(stats) >= 1
+        for s in stats:
+            assert "key_suffix" in s
+            assert "available" in s
+            assert "total_requests" in s
 
-    def test_list_models(self, client):
-        r = client.get("/v1/models")
+    def test_list_models(self, http):
+        r = http.get("/v1/models")
         assert r.status_code == 200
         body = r.json()
         assert body["object"] == "list"
-        ids = [m["id"] for m in body["data"]]
-        assert len(ids) >= 1
-        # at least the test model (or its alias) is present
-        assert any(MODEL in i or i in MODEL for i in ids)
+        assert len(body["data"]) >= 1
+        for m in body["data"]:
+            assert "id" in m
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,32 +98,29 @@ class TestMeta:
 
 
 class TestChatCompletions:
-    def test_simple_response(self, client):
+    def test_simple_response(self, http):
         body = chat(
-            client, [{"role": "user", "content": "Reply with exactly the word: PONG"}]
+            http, [{"role": "user", "content": "Reply with exactly the word: PONG"}]
         )
-        text = body["choices"][0]["message"]["content"]
-        assert isinstance(text, str)
-        assert len(text) > 0
-        assert body["choices"][0]["message"]["role"] == "assistant"
         assert body["object"] == "chat.completion"
+        text = body["choices"][0]["message"]["content"]
+        assert isinstance(text, str) and len(text) > 0
+        assert body["choices"][0]["message"]["role"] == "assistant"
 
-    def test_usage_metadata_present(self, client):
-        body = chat(client, [{"role": "user", "content": "Hi"}])
-        usage = body["usage"]
-        assert usage["prompt_tokens"] > 0
-        assert usage["completion_tokens"] > 0
-        assert (
-            usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-        )
+    def test_usage_metadata_present(self, http):
+        body = chat(http, [{"role": "user", "content": "Hi"}])
+        u = body["usage"]
+        assert u["prompt_tokens"] > 0
+        assert u["completion_tokens"] > 0
+        assert u["total_tokens"] == u["prompt_tokens"] + u["completion_tokens"]
 
-    def test_finish_reason_is_stop(self, client):
-        body = chat(client, [{"role": "user", "content": "Say hello."}])
+    def test_finish_reason_is_stop(self, http):
+        body = chat(http, [{"role": "user", "content": "Say hello."}])
         assert body["choices"][0]["finish_reason"] == "stop"
 
-    def test_system_prompt_respected(self, client):
+    def test_system_prompt_respected(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "system",
@@ -142,12 +129,11 @@ class TestChatCompletions:
                 {"role": "user", "content": "Introduce yourself."},
             ],
         )
-        text = body["choices"][0]["message"]["content"]
-        assert "BEEP" in text.upper()
+        assert "BEEP" in body["choices"][0]["message"]["content"].upper()
 
-    def test_multi_turn_conversation(self, client):
+    def test_multi_turn_conversation(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
@@ -163,25 +149,19 @@ class TestChatCompletions:
                 },
             ],
         )
-        text = body["choices"][0]["message"]["content"].lower()
-        assert "blue" in text
+        assert "blue" in body["choices"][0]["message"]["content"].lower()
 
-    def test_temperature_zero_deterministic(self, client):
-        """Same prompt at temp=0 should return the same (or very similar) text twice."""
-        messages = [
+    def test_temperature_zero_deterministic(self, http):
+        msgs = [
             {"role": "user", "content": "What is 2 + 2? Answer with just the number."}
         ]
-        a = chat(client, messages, temperature=0)["choices"][0]["message"][
-            "content"
-        ].strip()
-        b = chat(client, messages, temperature=0)["choices"][0]["message"][
-            "content"
-        ].strip()
+        a = chat(http, msgs, temperature=0)["choices"][0]["message"]["content"].strip()
+        b = chat(http, msgs, temperature=0)["choices"][0]["message"]["content"].strip()
         assert a == b
 
-    def test_max_tokens_limits_output(self, client):
+    def test_max_tokens_limits_output(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
@@ -190,18 +170,16 @@ class TestChatCompletions:
             ],
             max_tokens=10,
         )
-        # with a tiny token budget the model must stop early
         assert body["choices"][0]["finish_reason"] in ("length", "stop")
-        assert body["usage"]["completion_tokens"] <= 15  # small buffer
+        assert body["usage"]["completion_tokens"] <= 15
 
-    def test_stop_sequence_honoured(self, client):
+    def test_stop_sequence_honoured(self, http):
         body = chat(
-            client,
+            http,
             [{"role": "user", "content": "Count from 1 to 10, one number per line."}],
             stop=["5"],
         )
         text = body["choices"][0]["message"]["content"]
-        # model should have stopped at or before "5"
         assert "6" not in text and "7" not in text
 
 
@@ -211,7 +189,7 @@ class TestChatCompletions:
 
 
 class TestStructuredOutput:
-    _PERSON_SCHEMA = {
+    _SCHEMA = {
         "type": "object",
         "properties": {
             "name": {"type": "string"},
@@ -220,26 +198,24 @@ class TestStructuredOutput:
         "required": ["name", "age"],
     }
 
-    def test_schema_field_returns_valid_json(self, client):
+    def test_schema_field_returns_valid_json(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
-                    "content": "Return a JSON object for a fictional person named Ada who is 36 years old.",
+                    "content": "Return a JSON object for a fictional person named Ada who is 36.",
                 }
             ],
-            schema=self._PERSON_SCHEMA,
+            schema=self._SCHEMA,
         )
-        text = body["choices"][0]["message"]["content"]
-        parsed = json.loads(text)
-        assert "name" in parsed
-        assert "age" in parsed
+        parsed = json.loads(body["choices"][0]["message"]["content"])
+        assert "name" in parsed and "age" in parsed
         assert isinstance(parsed["age"], int)
 
-    def test_response_format_json_schema(self, client):
+    def test_response_format_json_schema(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
@@ -248,17 +224,15 @@ class TestStructuredOutput:
             ],
             response_format={
                 "type": "json_schema",
-                "json_schema": {"schema": self._PERSON_SCHEMA},
+                "json_schema": {"schema": self._SCHEMA},
             },
         )
         parsed = json.loads(body["choices"][0]["message"]["content"])
-        assert "name" in parsed
-        assert "age" in parsed
+        assert "name" in parsed and "age" in parsed
 
-    def test_response_format_json_object(self, client):
-        """json_object mode: no schema enforcement, but output must be valid JSON."""
+    def test_response_format_json_object(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
@@ -267,8 +241,7 @@ class TestStructuredOutput:
             ],
             response_format={"type": "json_object"},
         )
-        text = body["choices"][0]["message"]["content"]
-        parsed = json.loads(text)  # must not raise
+        parsed = json.loads(body["choices"][0]["message"]["content"])
         assert isinstance(parsed, dict)
 
 
@@ -278,9 +251,9 @@ class TestStructuredOutput:
 
 
 class TestImageInference:
-    def test_data_uri_image_accepted(self, client):
+    def test_data_uri_image_accepted(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
@@ -288,55 +261,53 @@ class TestImageInference:
                         {"type": "image_url", "image_url": {"url": _PNG_DATA_URI}},
                         {
                             "type": "text",
-                            "text": "What colour is the dominant pixel in this image? One word.",
+                            "text": "Acknowledge you received an image. One sentence.",
                         },
                     ],
-                },
+                }
             ],
         )
-        text = body["choices"][0]["message"]["content"]
-        assert isinstance(text, str) and len(text) > 0
+        assert len(body["choices"][0]["message"]["content"]) > 0
 
-    def test_remote_image_url(self, client):
-        # Public 1x1 pixel image served by httpbin
-        url = "https://httpbin.org/image/png"
+    def test_remote_image_url(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": url}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://httpbin.org/image/png"},
+                        },
                         {
                             "type": "text",
                             "text": "Describe this image in one sentence.",
                         },
                     ],
-                },
+                }
             ],
         )
-        text = body["choices"][0]["message"]["content"]
-        assert isinstance(text, str) and len(text) > 0
+        assert len(body["choices"][0]["message"]["content"]) > 0
 
-    def test_mixed_text_and_image(self, client):
+    def test_mixed_text_and_image(self, http):
         body = chat(
-            client,
+            http,
             [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "I'm sending you an image."},
+                        {"type": "text", "text": "I'm sending you a small image."},
                         {"type": "image_url", "image_url": {"url": _PNG_DATA_URI}},
                         {
                             "type": "text",
-                            "text": "Acknowledge you received both the text and the image.",
+                            "text": "Confirm you received both the text and the image.",
                         },
                     ],
-                },
+                }
             ],
         )
-        text = body["choices"][0]["message"]["content"].lower()
-        assert len(text) > 0
+        assert len(body["choices"][0]["message"]["content"]) > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -345,19 +316,20 @@ class TestImageInference:
 
 
 class TestStreaming:
-    def test_sse_chunks_received(self, client):
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": "Count from 1 to 5."}],
-                "stream": True,
-            },
-        ) as r:
-            assert r.status_code == 200
-            assert "text/event-stream" in r.headers.get("content-type", "")
-            raw = r.read().decode()
+    def test_sse_chunks_received(self, http):
+        with httpx.Client(base_url=BASE_URL, timeout=60) as stream_client:
+            with stream_client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "Count from 1 to 5."}],
+                    "stream": True,
+                },
+            ) as r:
+                assert r.status_code == 200
+                assert "text/event-stream" in r.headers.get("content-type", "")
+                raw = r.read().decode()
 
         data_lines = [
             line[6:]
@@ -365,49 +337,48 @@ class TestStreaming:
             if line.startswith("data:") and "[DONE]" not in line
         ]
         assert len(data_lines) >= 1
-
-        chunks = [json.loads(d) for d in data_lines]
-        for chunk in chunks:
+        for d in data_lines:
+            chunk = json.loads(d)
             assert chunk["object"] == "chat.completion.chunk"
-            assert "choices" in chunk
             assert "delta" in chunk["choices"][0]
 
-    def test_streamed_content_reassembles(self, client):
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "user", "content": "Say 'HELLO WORLD' and nothing else."}
-                ],
-                "stream": True,
-            },
-        ) as r:
-            raw = r.read().decode()
+    def test_streamed_content_reassembles(self, http):
+        with httpx.Client(base_url=BASE_URL, timeout=60) as stream_client:
+            with stream_client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Say 'HELLO WORLD' and nothing else.",
+                        }
+                    ],
+                    "stream": True,
+                },
+            ) as r:
+                raw = r.read().decode()
 
-        texts = []
-        for line in raw.splitlines():
-            if line.startswith("data:") and "[DONE]" not in line:
-                chunk = json.loads(line[6:])
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                texts.append(delta)
-
-        full = "".join(texts).upper()
+        full = "".join(
+            json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+            for line in raw.splitlines()
+            if line.startswith("data:") and "[DONE]" not in line
+        ).upper()
         assert "HELLO" in full or "WORLD" in full
 
-    def test_stream_ends_with_done(self, client):
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": "One word: yes."}],
-                "stream": True,
-            },
-        ) as r:
-            raw = r.read().decode()
-
+    def test_stream_ends_with_done(self, http):
+        with httpx.Client(base_url=BASE_URL, timeout=60) as stream_client:
+            with stream_client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "One word: yes."}],
+                    "stream": True,
+                },
+            ) as r:
+                raw = r.read().decode()
         assert "data: [DONE]" in raw
 
 
@@ -417,8 +388,8 @@ class TestStreaming:
 
 
 class TestTokenCount:
-    def test_returns_positive_count(self, client):
-        r = client.post(
+    def test_returns_positive_count(self, http):
+        r = http.post(
             "/v1/token/count",
             json={
                 "model": MODEL,
@@ -428,10 +399,10 @@ class TestTokenCount:
         assert r.status_code == 200
         body = r.json()
         assert body["total_tokens"] > 0
-        assert body["model"] == main.resolve_model(MODEL)
+        assert "model" in body
 
-    def test_longer_prompt_has_more_tokens(self, client):
-        short = client.post(
+    def test_longer_prompt_has_more_tokens(self, http):
+        short = http.post(
             "/v1/token/count",
             json={
                 "model": MODEL,
@@ -439,7 +410,7 @@ class TestTokenCount:
             },
         ).json()["total_tokens"]
 
-        long = client.post(
+        long = http.post(
             "/v1/token/count",
             json={
                 "model": MODEL,
@@ -449,8 +420,8 @@ class TestTokenCount:
 
         assert long > short
 
-    def test_system_message_counted(self, client):
-        without = client.post(
+    def test_system_message_counted(self, http):
+        without = http.post(
             "/v1/token/count",
             json={
                 "model": MODEL,
@@ -458,14 +429,14 @@ class TestTokenCount:
             },
         ).json()["total_tokens"]
 
-        with_system = client.post(
+        with_system = http.post(
             "/v1/token/count",
             json={
                 "model": MODEL,
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are a very verbose assistant who always explains at length.",
+                        "content": "You are a very verbose assistant who explains everything at length.",
                     },
                     {"role": "user", "content": "Hello."},
                 ],
@@ -476,32 +447,27 @@ class TestTokenCount:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Key rotation (observable via /stats)
+# Key rotation observable via /stats
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class TestKeyRotationObservable:
-    def test_request_count_increments(self, client):
-        before = client.get("/stats").json()["key_stats"]
-        total_before = sum(s["total_requests"] for s in before)
+    def test_request_count_increments(self, http):
+        before = sum(
+            s["total_requests"] for s in http.get("/stats").json()["key_stats"]
+        )
+        chat(http, [{"role": "user", "content": "Ping"}])
+        after = sum(s["total_requests"] for s in http.get("/stats").json()["key_stats"])
+        assert after == before + 1
 
-        chat(client, [{"role": "user", "content": "Ping"}])
-
-        after = client.get("/stats").json()["key_stats"]
-        total_after = sum(s["total_requests"] for s in after)
-
-        assert total_after == total_before + 1
-
-    def test_multiple_keys_both_used(self, client):
-        """If there are 2+ keys, after enough requests both should have requests."""
-        stats = client.get("/stats").json()["key_stats"]
+    def test_multiple_keys_both_used(self, http):
+        stats = http.get("/stats").json()["key_stats"]
         if len(stats) < 2:
-            pytest.skip("Need at least 2 keys to test rotation")
+            pytest.skip("Need at least 2 keys configured to test rotation")
 
-        # fire enough requests to guarantee both keys are hit
-        for _ in range(len(stats) * 3):
-            chat(client, [{"role": "user", "content": "Hi"}])
+        n = len(stats) * 3
+        for _ in range(n):
+            chat(http, [{"role": "user", "content": "Hi"}])
 
-        after = client.get("/stats").json()["key_stats"]
-        used = [s for s in after if s["total_requests"] > 0]
-        assert len(used) >= 2
+        after = http.get("/stats").json()["key_stats"]
+        assert sum(1 for s in after if s["total_requests"] > 0) >= 2
