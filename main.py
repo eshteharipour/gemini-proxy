@@ -125,10 +125,9 @@ class KeyEntry:
         logger.warning("Key ...%s cooled down for %ss", self.key[-6:], cooldown)
 
     def make_http_client(self) -> httpx.AsyncClient:
-        proxies = None
-        if self.proxy:
-            proxies = {"http://": self.proxy, "https://": self.proxy}
-        return httpx.AsyncClient(proxies=proxies, timeout=120)
+        # httpx >= 0.28 removed the `proxies` dict argument; use `proxy` (singular) instead
+        proxy = self.proxy if self.proxy else None
+        return httpx.AsyncClient(proxy=proxy, timeout=120)
 
 
 class KeyManager:
