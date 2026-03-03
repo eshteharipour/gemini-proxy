@@ -34,7 +34,6 @@ Features (identical surface to v1):
 
 import asyncio
 import base64
-import contextlib
 import json
 import logging
 import os
@@ -118,6 +117,8 @@ def debug_log(record: dict) -> None:
 # ---------------------------------------------------------------------------
 
 COOLDOWN_SECONDS = int(os.environ.get("KEY_COOLDOWN_SECONDS", "60"))
+# Optional proxy for general outbound HTTP (image downloads, etc.) — not used for Gemini.
+GENERAL_PROXY: str | None = os.environ.get("GENERAL_PROXY") or None
 ALL_EXHAUSTED_SLEEP = float(os.environ.get("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 DEFAULT_GEMINI_MODEL = os.environ.get(
@@ -184,38 +185,6 @@ def _parse_key_proxy_pairs() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Proxy env-var context manager
-# ---------------------------------------------------------------------------
-
-_ENV_PROXY_LOCK = (
-    asyncio.Lock()
-)  # global; only one SDK call at a time can mutate env vars
-_ENV_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
-
-
-@contextlib.contextmanager
-def _proxy_env(proxy: str | None):
-    """
-    Temporarily set/unset the four standard proxy env vars.
-    Must be called while holding _ENV_PROXY_LOCK.
-    """
-    saved = {k: os.environ.get(k) for k in _ENV_VARS}
-    try:
-        for k in _ENV_VARS:
-            if proxy:
-                os.environ[k] = proxy
-            else:
-                os.environ.pop(k, None)
-        yield
-    finally:
-        for k in _ENV_VARS:
-            if saved[k] is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = saved[k]
-
-
-# ---------------------------------------------------------------------------
 # Key / Proxy management
 # ---------------------------------------------------------------------------
 
@@ -238,10 +207,19 @@ class KeyEntry:
 
     def make_genai_client(self) -> genai.Client:
         """
-        Create a genai.Client for this key.
-        Proxy is handled at the call site via _proxy_env(); the client itself
-        is stateless with respect to proxy.
+        Create a genai.Client wired to this entry's proxy.
+
+        The google-genai SDK accepts ``http_options`` at client construction time
+        and threads the proxy URL through its internal httpx transport correctly.
+        Passing ``proxy_url`` inside ``http_options`` is the only reliable way —
+        mutating environment variables after the process starts does not work
+        because httpcore caches its connection pools at import time.
         """
+        if self.proxy:
+            return genai.Client(
+                api_key=self.key,
+                http_options=types.HttpOptions(proxy_url=self.proxy),
+            )
         return genai.Client(api_key=self.key)
 
 
@@ -338,7 +316,8 @@ def _url_to_part(url: str) -> types.Part:
         mime = header.split(";")[0].split(":")[1]
         return types.Part.from_bytes(data=base64.b64decode(b64), mime_type=mime)
 
-    with httpx.Client(timeout=30, follow_redirects=True) as client:
+    proxy_kwargs = {"proxy": GENERAL_PROXY} if GENERAL_PROXY else {}
+    with httpx.Client(timeout=30, follow_redirects=True, **proxy_kwargs) as client:
         resp = client.get(url)
         resp.raise_for_status()
     mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
@@ -504,20 +483,10 @@ def _classify_genai_exception(exc: Exception) -> _GeminiError:
     return _GeminiError(502, msg)
 
 
-async def _run_with_proxy(entry: KeyEntry, fn, *args, **kwargs):
-    """
-    Run a synchronous SDK call `fn(*args, **kwargs)` in a thread-pool executor,
-    but first atomically swap proxy env vars to match this entry's proxy.
-
-    The global _ENV_PROXY_LOCK ensures only one thread mutates the env at a time.
-    """
+async def _run_in_executor(fn, *args, **kwargs):
+    """Run a synchronous SDK call in the default thread-pool executor."""
     loop = asyncio.get_running_loop()
-
-    async with _ENV_PROXY_LOCK:
-        with _proxy_env(entry.proxy):
-            result = await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
-
-    return result
+    return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -601,8 +570,7 @@ async def call_gemini(key_manager: KeyManager, req: ChatCompletionRequest) -> di
             )
 
         try:
-            response = await _run_with_proxy(
-                entry,
+            response = await _run_in_executor(
                 client.models.generate_content,
                 model=gemini_model,
                 contents=contents,
@@ -711,22 +679,17 @@ async def call_gemini_stream(
     t0 = time.monotonic()
     client = entry.make_genai_client()
 
-    # generate_content_stream is synchronous; wrap it to respect proxy env
-    loop = asyncio.get_running_loop()
-
+    # generate_content_stream is synchronous; collect all chunks in an executor
     try:
-        async with _ENV_PROXY_LOCK:
-            with _proxy_env(entry.proxy):
-                stream_iter = await loop.run_in_executor(
-                    None,
-                    lambda: list(
-                        client.models.generate_content_stream(
-                            model=gemini_model,
-                            contents=contents,
-                            config=config,
-                        )
-                    ),
+        stream_iter = await _run_in_executor(
+            lambda: list(
+                client.models.generate_content_stream(
+                    model=gemini_model,
+                    contents=contents,
+                    config=config,
                 )
+            )
+        )
     except Exception as exc:
         entry.total_errors += 1
         entry.mark_exhausted()
@@ -796,7 +759,7 @@ async def call_gemini_stream(
 
 async def count_tokens_gemini(key_manager: KeyManager, req: TokenCountRequest) -> int:
     gemini_model = resolve_model(req.model)
-    _, contents = _messages_to_genai(req.messages)
+    system_instruction, contents = _messages_to_genai(req.messages)
 
     entry = await key_manager.next_available()
     entry.total_requests += 1
@@ -814,12 +777,19 @@ async def count_tokens_gemini(key_manager: KeyManager, req: TokenCountRequest) -
     t0 = time.monotonic()
     client = entry.make_genai_client()
 
+    # Build config with system instruction so token count matches inference
+    count_config = None
+    if system_instruction:
+        count_config = types.GenerateContentConfig(
+            system_instruction=system_instruction
+        )
+
     try:
-        result = await _run_with_proxy(
-            entry,
+        result = await _run_in_executor(
             client.models.count_tokens,
             model=gemini_model,
             contents=contents,
+            config=count_config,
         )
     except Exception as exc:
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)

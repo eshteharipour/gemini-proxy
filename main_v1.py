@@ -127,6 +127,9 @@ def debug_log(record: dict) -> None:
 # ---------------------------------------------------------------------------
 
 COOLDOWN_SECONDS = int(os.environ.get("KEY_COOLDOWN_SECONDS", "60"))
+# Optional proxy for general outbound HTTP (image downloads, etc.) — not used for Gemini.
+# Set GENERAL_PROXY=http://host:port in your env or .env file.
+GENERAL_PROXY: str | None = os.environ.get("GENERAL_PROXY") or None
 ALL_EXHAUSTED_SLEEP = float(os.environ.get("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 DEFAULT_GEMINI_MODEL = os.environ.get(
@@ -331,7 +334,8 @@ def _url_to_inline_data(url: str) -> dict:
         return {"inlineData": {"mimeType": mime, "data": b64}}
 
     # Remote URL – download synchronously (called before async context starts)
-    with httpx.Client(timeout=30, follow_redirects=True) as client:
+    proxy_kwargs = {"proxy": GENERAL_PROXY} if GENERAL_PROXY else {}
+    with httpx.Client(timeout=30, follow_redirects=True, **proxy_kwargs) as client:
         resp = client.get(url)
         resp.raise_for_status()
     mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
@@ -695,6 +699,21 @@ async def call_gemini_stream(
                     chunk_idx += 1
                     yield f"data: {json.dumps(openai_chunk)}\n\n"
 
+            # Gemini didn't send an explicit [DONE] — emit it ourselves so clients
+            # relying on the OpenAI SSE contract always see the sentinel.
+            debug_log(
+                {
+                    "event": "stream_end",
+                    "endpoint": endpoint,
+                    "key_suffix": entry.key[-6:],
+                    "status": 200,
+                    "total_chunks": chunk_idx,
+                    "elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
+                    "chunks": stream_chunks,
+                }
+            )
+            yield "data: [DONE]\n\n"
+
 
 # ---------------------------------------------------------------------------
 # Token counting
@@ -703,8 +722,10 @@ async def call_gemini_stream(
 
 async def count_tokens_gemini(key_manager: KeyManager, req: TokenCountRequest) -> int:
     gemini_model = resolve_model(req.model)
-    _, contents = _messages_to_gemini(req.messages)
-    payload = {"contents": contents}
+    system_instruction, contents = _messages_to_gemini(req.messages)
+    payload: dict[str, Any] = {"contents": contents}
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
     entry = await key_manager.next_available()
     entry.total_requests += 1
