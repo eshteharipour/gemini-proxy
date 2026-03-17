@@ -24,8 +24,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = os.environ.get("PROXY_BASE_URL", "http://localhost:8000").rstrip("/")
-MODEL = os.environ.get("TEST_GEMINI_MODEL", "gemini-flash-lite-latest")
+BASE_URL = os.getenv("PROXY_BASE_URL", "http://localhost:8000").rstrip("/")
+MODEL = os.getenv("TEST_GEMINI_MODEL", "gemini-flash-lite-latest")
 
 # Tiny 1×1 transparent PNG (public domain)
 _PNG_1X1_B64 = (

@@ -63,8 +63,8 @@ load_dotenv()
 # DEBUG_MODE=1  → stderr + file handlers (DEBUG level) AND JSONL payload log
 # DEBUG_MODE=0  → stderr INFO only (unchanged)
 
-DEBUG_MODE: bool = os.environ.get("DEBUG_MODE", "0").strip() in ("1", "true", "yes")
-DEBUG_LOG_FILE: str = os.environ.get("DEBUG_LOG_FILE", "gemini_proxy_debug.log")
+DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "0").strip() in ("1", "true", "yes")
+DEBUG_LOG_FILE: str = os.getenv("DEBUG_LOG_FILE", "gemini_proxy_debug.log")
 
 _fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
@@ -119,14 +119,12 @@ def debug_log(record: dict) -> None:
 # Configuration
 # ---------------------------------------------------------------------------
 
-COOLDOWN_SECONDS = int(os.environ.get("KEY_COOLDOWN_SECONDS", "60"))
+COOLDOWN_SECONDS = int(os.getenv("KEY_COOLDOWN_SECONDS", "60"))
 # Optional proxy for general outbound HTTP (image downloads, etc.) — not used for Gemini.
-GENERAL_PROXY: str | None = os.environ.get("GENERAL_PROXY") or None
-ALL_EXHAUSTED_SLEEP = float(os.environ.get("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
-DEFAULT_GEMINI_MODEL = os.environ.get(
-    "DEFAULT_GEMINI_MODEL", "gemini-flash-lite-latest"
-)
+GENERAL_PROXY: str | None = os.getenv("GENERAL_PROXY") or None
+ALL_EXHAUSTED_SLEEP = float(os.getenv("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+DEFAULT_GEMINI_MODEL = os.getenv("DEFAULT_GEMINI_MODEL", "gemini-flash-lite-latest")
 
 
 def _parse_key_proxy_pairs() -> list[dict]:
@@ -147,14 +145,14 @@ def _parse_key_proxy_pairs() -> list[dict]:
 
     i = 0
     while True:
-        key = os.environ.get(f"GEMINI_KEY_{i}")
+        key = os.getenv(f"GEMINI_KEY_{i}")
         if key is None:
             break
-        proxy = os.environ.get(f"GEMINI_PROXY_{i}")
+        proxy = os.getenv(f"GEMINI_PROXY_{i}")
         pairs.append({"key": key.strip(), "proxy": proxy.strip() if proxy else None})
         i += 1
 
-    for token in os.environ.get("GEMINI_PAIRS_CSV", "").split(","):
+    for token in os.getenv("GEMINI_PAIRS_CSV", "").split(","):
         token = token.strip()
         if not token:
             continue
@@ -168,12 +166,10 @@ def _parse_key_proxy_pairs() -> list[dict]:
 
     if not pairs:
         keys = [
-            k.strip()
-            for k in os.environ.get("GEMINI_API_CSV", "").split(",")
-            if k.strip()
+            k.strip() for k in os.getenv("GEMINI_API_CSV", "").split(",") if k.strip()
         ]
         proxies = [
-            p.strip() for p in os.environ.get("PROXY_CSV", "").split(",") if p.strip()
+            p.strip() for p in os.getenv("PROXY_CSV", "").split(",") if p.strip()
         ]
         for idx, key in enumerate(keys):
             proxy = proxies[idx % len(proxies)] if proxies else None
@@ -207,7 +203,7 @@ def _proxy_env(proxy: str | None):
     Temporarily set/unset the four standard proxy env vars.
     Must be called while the caller holds _ENV_PROXY_LOCK.
     """
-    saved = {k: os.environ.get(k) for k in _ENV_VARS}
+    saved = {k: os.getenv(k) for k in _ENV_VARS}
     try:
         for k in _ENV_VARS:
             if proxy:
@@ -958,7 +954,7 @@ async def stats():
 if __name__ == "__main__":
     uvicorn.run(
         "main_v2:app",
-        host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8000")),
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
         reload=False,
     )

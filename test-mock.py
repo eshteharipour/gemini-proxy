@@ -898,7 +898,7 @@ class TestKeyRotationAndCooldown:
         assert r.status_code in (429, 502)
 
         # restore
-        main.MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+        main.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 
 class TestProxyPairing:
