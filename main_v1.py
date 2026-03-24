@@ -132,7 +132,6 @@ COOLDOWN_SECONDS = int(os.getenv("KEY_COOLDOWN_SECONDS", "60"))
 GENERAL_PROXY: str | None = os.getenv("GENERAL_PROXY") or None
 ALL_EXHAUSTED_SLEEP = float(os.getenv("ALL_EXHAUSTED_SLEEP_SECONDS", "5"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-DEFAULT_GEMINI_MODEL = os.getenv("DEFAULT_GEMINI_MODEL", "gemini-flash-lite-latest")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
@@ -289,7 +288,7 @@ class Message(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = DEFAULT_GEMINI_MODEL
+    model: str
     messages: list[Message]
     temperature: float | None = 1.0
     max_tokens: int | None = 8192
@@ -310,7 +309,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class TokenCountRequest(BaseModel):
-    model: str = DEFAULT_GEMINI_MODEL
+    model: str
     messages: list[Message]
 
 

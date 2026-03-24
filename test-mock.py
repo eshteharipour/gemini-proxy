@@ -74,7 +74,7 @@ from main_v2 import (
 # ── Constants ────────────────────────────────────────────────────────────────
 GEMINI_BASE = main.GEMINI_BASE
 FAKE_KEY = "fake-key-aaaaaa"
-MODEL = "gemini-flash-lite-latest"
+MODEL = os.getenv("TEST_GEMINI_MODEL", "gemini-flash-lite-latest")
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
