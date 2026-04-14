@@ -5,7 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+# Choose to use v1 or v2
+# COPY main_v1.py main.py
+COPY main_v2.py main.py
 
 ENV HOST=0.0.0.0
 ENV PORT=8000

@@ -32,15 +32,16 @@ output**, and **token counting**.
 
 ## 🏛️ Architecture
 
-    OpenAI Client ──▶ Proxy (FastAPI) ──▶ Key Manager (round-robin) ──▶ Gemini API
-                      │                       │
-                      │                       ├─ Per-key proxy support
-                      │                       └─ Auto-cooldown on 429/503
-                      │
-                      ├─ /v1/chat/completions
-                      ├─ /v1/token/count
-                      ├─ /health
-                      └─ /stats
+```
+OpenAI Client ──▶ Proxy (FastAPI) ──▶ Key Manager (round-robin) ──▶ Gemini API
+                  │                       │
+                  │                       ├─ Per-key proxy support
+                  │                       └─ Auto-cooldown on 429/503
+                  │
+                  ├─ /v1/chat/completions
+                  ├─ /v1/token/count
+                  ├─ /health
+                  └─ /stats
 ```
 
 ---
